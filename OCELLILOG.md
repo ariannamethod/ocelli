@@ -67,6 +67,31 @@ expands every weight to f32 before every matmul, so ~500M weights are dequantise
 per token. Descriptions agree between the two paths on most frames and diverge on
 near-tie tokens, deterministically.
 
+### Objective probe: small-text reading, 14 frames
+
+Comparing free-form descriptions against a reference runtime is not a truth
+test — both can invent clothing that is not in the frame, and on one portrait
+both did (ours "white shirt", the reference "purple shirt", while the crop shows
+no shirt at all). So the probe was narrowed to something with a knowable answer.
+
+All 14 portraits carry the same watermark, `StyleGAN2 (Karras et al.)`, verified
+by eye on two of them. Same weights, same prompt, same frames:
+
+| runtime | watermark read correctly | corrupted readings |
+|---|---|---|
+| this engine | 0 / 14 | 2 (`Sylvanian`, `Icac`) |
+| reference runtime | 5 / 14 | 3 (`StyGAN2`, `StyleGAN Karras et al.`, `MEG222`) |
+
+Neither is good at it; the gap is one-sided. Since the weights are identical,
+the loss is in our vision path — f32 tower against the reference's f16/mixed,
+and possibly resize or normalisation upstream of it. This is the acceptance gate
+for any accuracy work on the tower: the count on these 14 frames must rise.
+
+Corollary, recorded so it is not relitigated: fine-tuning the weights is the
+wrong instrument for this defect. It would compensate a runtime inaccuracy by
+altering the model, welding our own error into the weights. Data first, and a
+labelled set of real frames, before any training is discussed.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships
