@@ -1,0 +1,80 @@
+# OCELLILOG
+
+Working log of the ocelli engine. Newest entries at the bottom. Every claim here
+carries the command, file, or number it came from — this log is read by other
+machines working on the same repo, so it records what changed in the system, not
+who was in the room.
+
+---
+
+## 2026-07-27 — repo founded, engine moved in
+
+The engine was developed inside a fork of a quiz application and has outgrown it:
+it is an inference organ, not a game feature. Moved out as its own project.
+
+**What moved:** `ocelli.c` (orchestrator, text decoder, vision splice — formerly
+`smolvlm.c`), `vision.c/.h` (idefics3 preprocessing, SigLIP tower, pixel-shuffle
+connector), `gguf.c/.h`, `bpe.c/.h` (GPT-2 byte-level BPE, special-token aware),
+vendored `notorch.c/.h`, `notorch_vision.h`, `stb_image.h`, and the `eye` CLI.
+Added: `Makefile` (BLAS on by default, `BLAS=0` for a portable build, `asan`
+target), `.gitignore` (weights and binaries never committed), README.
+
+**Own code vs vendored:** 1918 lines of engine C, 14349 lines vendored from the
+notorch canon (`wc -l`).
+
+### State carried over
+
+- Two model generations run on this engine: SmolVLM-256M-Instruct and
+  SmolVLM2-500M-Video-Instruct with a contract fine-tune (the Yent eye).
+- Architecture is read from the file, never assumed: for the 500M weights the
+  loader reports `E=960 H=15 KV=5 FFN=2560 V=49280 L=32 HD=64 rope=100000
+  rms=1e-05`, matching `llama-mtmd-cli` metadata for the same GGUF.
+- Vision tower reports `L=12 D=768 img=512 patch=16 patches=1024 eps=1e-06`,
+  producing `[1024,768]` hidden states and `[64,960]` visual embeddings, NaN=0.
+- Special tokens are identical across both generations (`<image>`=49190,
+  `<fake_token_around_image>`=49189, `<global-img>`=49152,
+  `<end_of_utterance>`=49279), prompt layout is 84 tokens.
+
+### Fixed on the way in: MLP role must come from shape, not name
+
+Loading the 500M weights produced a coherent text decoder but garbage
+descriptions, while the reference runtime handled the same two files correctly.
+Cause: the vision tower had a hardcoded `ffn_up` ↔ `ffn_down` swap, introduced
+because one GGUF converter mirrors those names. A newer converter does not
+mirror them, so the swap corrupted all 12 SigLIP layers.
+
+Ground truth is the bias length in the file (`llama-gguf`): the older mmproj has
+`ffn_down.bias = 12288 B`, the newer one has `ffn_up.bias = 12288 B`, and the
+bias values themselves match between files to the digit (`-0.894531`,
+`-1.398438`, `0.099609`) — the same SigLIP weights under mirrored names.
+
+Fix: `siglip_load` now resolves fc1/fc2 per layer from the bias element count
+(fc1 ⇔ bias == ffn); a length matching neither `ffn` nor `hidden` is a loud
+load failure. Both conventions work; the older generation still reproduces its
+stored reference outputs word for word.
+
+### Cost, measured
+
+Phone-class A18 Pro, 500M weights, one 512×512 frame, 84-token prompt:
+
+| weights | prompt | generation | peak RSS |
+|---|---|---|---|
+| f16 | 3.6–4.1 tok/s | 3.8–3.9 tok/s | 1.0–1.4 GB |
+| Q8_0 | 30.3–33.3 tok/s | 26.0–34.6 tok/s | 1.8–2.5 GB |
+
+The 8× gap is not arithmetic. Q8_0 is dequantised once at load; the f16 path
+expands every weight to f32 before every matmul, so ~500M weights are dequantised
+per token. Descriptions agree between the two paths on most frames and diverge on
+near-tie tokens, deterministically.
+
+### Open
+
+- Hot path still runs dense f32 through BLAS. The vendored notorch already ships
+  packed kernels (`nt_qmatvec`, row kernels for `q4_0/q8_0/q5_0/q4_k/q6_k`) that
+  dequantise per block in registers with no f32 resident. Moving the decoder and
+  the tower onto them is the path to phone-sized memory; acceptance is a parity
+  run against the current Q8 path with named divergences, plus speed and RSS on
+  the same frames.
+- Not bit-exact against the reference runtime (f32 tower vs f16/mixed there).
+- Small phone-sized text is a blind spot.
+- Camera input (V4L2 / phone) is not implemented; the eye currently eats files.
