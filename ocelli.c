@@ -390,31 +390,70 @@ int main(int argc, char **argv) {
     if (image_path && mmproj_path && bpe) {
         siglip_model *vm = siglip_load(mmproj_path);
         if (!vm) { fprintf(stderr, "mmproj load failed: %s\n", mmproj_path); return 1; }
-        int nf = 0, S = 0;
-        float *fr = smolvlm_preprocess(image_path, &nf, &S);
+        int nf = 0, S = 0, n_rows = 1, n_cols = 1;
+        float *fr = smolvlm_preprocess_grid(image_path, &nf, &S, &n_rows, &n_cols);
         if (!fr) { fprintf(stderr, "preprocess failed: %s\n", image_path); return 1; }
         int P = siglip_n_patches(vm), NV = siglip_n_vis_tokens(vm), TD = siglip_text_dim(vm);
-        float *hid  = (float*)malloc((long)P * siglip_hidden(vm) * sizeof(float));
-        float *vemb = (float*)malloc((long)NV * TD * sizeof(float));
-        if (!hid || !vemb || siglip_encode(vm, fr, hid) != 0 || siglip_connect(vm, hid, vemb) != 0) {
-            fprintf(stderr, "vision encode/connect failed\n"); return 1; }
-        free(hid); free(fr);
         if (TD != model->embed) { fprintf(stderr, "dim mismatch vis=%d text=%d\n", TD, model->embed); return 1; }
 
-        // prompt: <|im_start|>User:<fake><global-img>(<image> x NV)<fake>{instr}<end_of_utterance>\nAssistant:
-        const char *instr = prompt ? prompt : "Describe this image in one sentence.";
-        char *buf = (char*)malloc((long)NV * 8 + strlen(instr) + 256);
-        // idefics3 single-image (no split), 84-token layout matching llama-mtmd-cli:
-        // <|im_start|>User:\n<fake><global-img>(<image> x NV)<fake>\n{instr}<end_of_utterance>\nAssistant:
-        int off = sprintf(buf, "<|im_start|>User:\n<fake_token_around_image><global-img>");
-        for (int j = 0; j < NV; j++) off += sprintf(buf + off, "<image>");
-        sprintf(buf + off, "<fake_token_around_image>\n%s<end_of_utterance>\nAssistant:", instr);
+        /* Every frame goes through the tower: a 1024x1024 photo is 16 tiles plus
+         * one global frame, and encoding only the first one is what made small
+         * text unreadable — the engine was looking at a 17th of the detail. */
+        long frame_floats = (long)3 * S * S;
+        int n_vis_total = nf * NV;
+        printf("image=%s  frames=%d (%dx%d tiles + global), %d visual tokens\n",
+               image_path, nf, n_rows, n_cols, n_vis_total);
+        fflush(stdout);
+        float *hid  = (float*)malloc((long)P * siglip_hidden(vm) * sizeof(float));
+        float *vemb = (float*)malloc((long)n_vis_total * TD * sizeof(float));
+        if (!hid || !vemb) { fprintf(stderr, "vision alloc failed\n"); return 1; }
+        double t_vis = now_ms();
+        for (int f = 0; f < nf; f++) {
+            if (siglip_encode(vm, fr + (long)f * frame_floats, hid) != 0 ||
+                siglip_connect(vm, hid, vemb + (long)f * NV * TD) != 0) {
+                fprintf(stderr, "vision encode/connect failed on frame %d/%d\n", f, nf); return 1; }
+            printf("\r  vision: frame %d/%d", f + 1, nf); fflush(stdout);
+        }
+        printf("\r  vision: %d frames in %.0f ms            \n", nf, now_ms() - t_vis);
+        free(hid); free(fr);
 
-        int img_max = 64, MS = 1024;
+        /* idefics3 layout. Split form (tiles present) is row-major per-tile
+         * markers, a newline after each tile row, then the global frame — the
+         * token count of that layout reproduces the reference runtime's prompt
+         * length on the same image (1143 tokens for a 4x4 grid). Single-frame
+         * form is the 84-token layout verified earlier against the same oracle. */
+        const char *instr = prompt ? prompt : "Describe this image in one sentence.";
+        size_t cap = (size_t)n_vis_total * 8 + (size_t)nf * 32 + strlen(instr) + 512;
+        char *buf = (char*)malloc(cap);
+        if (!buf) { fprintf(stderr, "prompt alloc failed\n"); return 1; }
+        size_t off = (size_t)snprintf(buf, cap, "<|im_start|>User:\n");
+        if (nf > 1) {
+            for (int r = 0; r < n_rows; r++) {
+                for (int c = 0; c < n_cols; c++) {
+                    off += snprintf(buf + off, cap - off,
+                                    "<fake_token_around_image><row_%d_col_%d>", r + 1, c + 1);
+                    for (int j = 0; j < NV; j++) off += snprintf(buf + off, cap - off, "<image>");
+                }
+                off += snprintf(buf + off, cap - off, "\n");
+            }
+            off += snprintf(buf + off, cap - off, "\n<fake_token_around_image><global-img>");
+            for (int j = 0; j < NV; j++) off += snprintf(buf + off, cap - off, "<image>");
+            snprintf(buf + off, cap - off,
+                     "<fake_token_around_image>%s<end_of_utterance>\nAssistant:", instr);
+        } else {
+            off += snprintf(buf + off, cap - off, "<fake_token_around_image><global-img>");
+            for (int j = 0; j < NV; j++) off += snprintf(buf + off, cap - off, "<image>");
+            snprintf(buf + off, cap - off,
+                     "<fake_token_around_image>\n%s<end_of_utterance>\nAssistant:", instr);
+        }
+
+        /* 17 frames x 64 visual tokens plus chat wrapping needs room to breathe */
+        int img_max = 64, MS = 2048;
         int *toks = (int*)calloc(MS, sizeof(int));
         int n_tok = bpe_encode(bpe, buf, toks, MS - img_max);
         free(buf);
-        printf("image=%s  prompt=%d tok (vis=%d)\n", image_path, n_tok, NV);
+        printf("image=%s  prompt=%d tok (vis=%d, frames=%d = %dx%d tiles + global)\n",
+               image_path, n_tok, n_vis_total, nf, n_rows, n_cols);
         double t_start = now_ms();
 
         kv_cache *kv = kv_new(model->n_layers, MS, model->kv_dim);
@@ -422,9 +461,11 @@ int main(int argc, char **argv) {
         int vis_slot = 0;
         for (int i = 0; i < n_tok; i++) {
             const float *ov = NULL;
-            if (toks[i] == 49190 && vis_slot < NV) ov = vemb + (long)(vis_slot++) * TD;  // splice
+            if (toks[i] == 49190 && vis_slot < n_vis_total) ov = vemb + (long)(vis_slot++) * TD;  // splice
             llama_forward(model, kv, toks[i], i, logits, ov);
         }
+        if (vis_slot != n_vis_total)   /* layout and budget must agree, or the tail is blind */
+            fprintf(stderr, "warning: spliced %d of %d visual tokens\n", vis_slot, n_vis_total);
         double t_prompt = now_ms() - t_start;
         char piece[256];
         int n_gen = 0;

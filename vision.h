@@ -2,20 +2,29 @@
  * vision.h — SmolVLM / idefics3 image preprocessing (PHASE 2) and, later,
  * the SigLIP vision tower + pixel-shuffle connector.
  *
- * THIS phase: smolvlm_preprocess() turns an image file into N normalized
- * 512x512 RGB frames the way the idefics3 image processor does:
- *   - cap longest edge to 2048
+ * smolvlm_preprocess() turns an image file into N normalized 512x512 RGB frames
+ * the way the idefics3 image processor does:
+ *   - scale the longest edge TO 2048 (up or down — not a cap)
  *   - split into an n_rows x n_cols grid of 512x512 tiles (if >1 tile)
- *   - append one global image (full frame resized to 512x512)
+ *   - append one global image (full frame resized to 512x512), always last
  *   - rescale 1/255 (done on load) + normalize mean/std = 0.5/0.5/0.5  -> [-1,1]
- * Each frame later yields 64 visual tokens via the pixel-shuffle connector.
+ * Each frame yields 64 visual tokens via the pixel-shuffle connector, so a
+ * 1024x1024 photo becomes 17 frames = 1088 visual tokens, matching the slice
+ * count of the reference runtime. SMOLVLM_NOSPLIT=1 forces a single global
+ * frame: cheap, and blind to small text.
  */
 #ifndef VISION_H
 #define VISION_H
 
 /* Preprocess image -> out_n_frames frames, each [3, S, S] (S = out_S = 512),
  * channel-first, normalized to [-1,1]. Returns malloc'd float* of
- * n_frames*3*S*S (caller frees), or NULL on failure. */
+ * n_frames*3*S*S (caller frees), or NULL on failure.
+ * out_rows/out_cols receive the tile grid (1x1 when there is only a global
+ * frame); the caller needs it to emit the <row_i_col_j> markers. Either may
+ * be NULL. Frame order is row-major tiles first, global frame last. */
+float* smolvlm_preprocess_grid(const char* path, int* out_n_frames, int* out_S,
+                               int* out_rows, int* out_cols);
+/* grid-less shorthand, kept for the probe modes */
 float* smolvlm_preprocess(const char* path, int* out_n_frames, int* out_S);
 
 /* ── SigLIP vision tower (PHASE 3) ──────────────────────────────────────────

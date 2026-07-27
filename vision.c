@@ -39,30 +39,36 @@ static void norm_frame(float* f) {
     for (long i = 0; i < n; i++) f[i] = (f[i] - 0.5f) / 0.5f;
 }
 
-float* smolvlm_preprocess(const char* path, int* out_n_frames, int* out_S) {
+float* smolvlm_preprocess_grid(const char* path, int* out_n_frames, int* out_S,
+                               int* out_rows, int* out_cols) {
     nt_image* img = nt_image_load(path, 3);          /* CHW float in [0,1] */
     if (!img) return NULL;
 
-    /* cap longest edge to 2048 (preserve aspect) */
+    /* idefics3 splitting, geometry taken from the reference runtime rather than
+     * from the HF config: scale the LONGEST edge to 2048 — up or down, this is
+     * not a cap — then cut a ceil(W/512) x ceil(H/512) grid of 512 tiles and
+     * append one global frame. Verified against llama-mtmd-cli slice counts:
+     * 1024x1024 -> 4x4+1 = 17, 640x448 -> 4x3+1 = 13, 896x727 -> 4x4+1 = 17.
+     * SMOLVLM_NOSPLIT=1 falls back to a single global frame (64 tokens): far
+     * cheaper, far blinder — small text is lost at that resolution. */
     int W = img->width, H = img->height;
-    if (W > LONGEST || H > LONGEST) {
+    {
         float s = (float)LONGEST / (W > H ? W : H);
         int nw = (int)(W * s + 0.5f), nh = (int)(H * s + 0.5f);
-        nt_image* r = nt_image_resize(img, nw, nh);
-        img_free(img);
-        if (!r) return NULL;
-        img = r; W = img->width; H = img->height;
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        if (nw != W || nh != H) {
+            nt_image* r = nt_image_resize(img, nw, nh);
+            img_free(img);
+            if (!r) return NULL;
+            img = r; W = img->width; H = img->height;
+        }
     }
 
     int n_cols = (W + TILE - 1) / TILE;
     int n_rows = (H + TILE - 1) / TILE;
     int n_tiles = n_rows * n_cols;
-    /* Default: NO splitting — matches the oracle (llama-mtmd-cli encodes one
-     * global 512x512 frame = 64 tokens; it does not tile SmolVLM by default,
-     * despite HF's do_image_splitting=true). Opt-in tiling via SMOLVLM_SPLIT=1
-     * (HF-transformers behavior, for large images / higher fidelity). */
-    int want_split = (getenv("SMOLVLM_SPLIT") != NULL);
-    int splitting = want_split && (n_tiles > 1);
+    int splitting = (getenv("SMOLVLM_NOSPLIT") == NULL) && (n_tiles > 1);
     int n_frames = splitting ? n_tiles + 1 : 1;      /* tiles + one global, or just global */
 
     float* out = (float*)malloc((long)n_frames * 3 * TILE * TILE * sizeof(float));
@@ -91,7 +97,13 @@ float* smolvlm_preprocess(const char* path, int* out_n_frames, int* out_S) {
 
     *out_n_frames = n_frames;
     *out_S = TILE;
+    if (out_rows) *out_rows = splitting ? n_rows : 1;
+    if (out_cols) *out_cols = splitting ? n_cols : 1;
     return out;
+}
+
+float* smolvlm_preprocess(const char* path, int* out_n_frames, int* out_S) {
+    return smolvlm_preprocess_grid(path, out_n_frames, out_S, NULL, NULL);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────

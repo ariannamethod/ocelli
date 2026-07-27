@@ -92,6 +92,47 @@ wrong instrument for this defect. It would compensate a runtime inaccuracy by
 altering the model, welding our own error into the weights. Data first, and a
 labelled set of real frames, before any training is discussed.
 
+### Root cause of the blindness: one frame where the reference sends seventeen
+
+The small-text failure was not the resize filter and not the weights. The
+engine encoded a single global frame — 64 visual tokens — while the reference
+runtime tiles the image and encodes many. Slice counts taken from its own log:
+
+| frame | size | reference slices |
+|---|---|---|
+| portrait | 1024×1024 | 17 |
+| terminal capture | 640×448 | 13 |
+| app screenshot | 896×727 | 17 |
+
+The rule reproduces on all three: scale the **longest edge to 2048** (up as well
+as down — it was implemented here as a cap only), cut a `ceil(W/512) × ceil(H/512)`
+grid of 512 tiles, append one global frame. 1024×1024 → 4×4+1 = 17.
+
+A tiling path existed behind an opt-in flag but was dead: the preprocessor cut
+the frames while the engine still encoded only the first one and spliced 64
+tokens — and the first frame is the top-left tile, not the global view, so the
+flag made descriptions worse, not better. The flag was calibrated in June
+against a reference build that did not tile at the time; that calibration
+expired with the upstream change and nobody re-checked it.
+
+Now: every frame goes through the tower, the prompt carries per-tile
+`<row_i_col_j>` markers row-major with a newline per tile row followed by the
+global frame, and all `nf × 64` embeddings are spliced. Layout is confirmed by
+token count rather than by reading someone's source — 1143 prompt tokens on a
+4×4 grid, the exact prompt length the reference reports for the same image.
+
+**Result on the frame that used to fail:** the watermark, previously read as
+`Sylvanian`, now comes out verbatim: `StyleGAN2 (Karras et al.)`.
+
+**Price:** `prompt 1143 tok in 374955 ms (3.0 tok/s) | gen 40 tok in 15477 ms |
+peak RSS 1110 MB` — seventeen tower passes and 1143 decoder forwards. Memory is
+unchanged; time is six minutes per frame on the f16 path. Packed kernels are no
+longer an optimisation, they are what makes this usable.
+
+**Not fixed by tiling, and not ours to fix in code:** both runtimes invent
+clothing that is not in the frame (ours "glasses and a necklace", the reference
+"purple shirt", on a crop showing neither). That is a data question.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships
