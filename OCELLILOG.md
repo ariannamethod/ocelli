@@ -300,6 +300,12 @@ reference path. Whole frame is about 22 s.
 Still short of the reference's 88.4 tok/s — that gap is now attention plus the
 tower, not FFN.
 
+Across all 14 portraits the count holds and completeness moves: exact path reads
+`StyleGAN2` on 4 frames with 2 of them carrying `Karras et al.` as well; hybrid
+reads the same 4 with all 4 complete. Not claimed as better sight — the extra
+half-strings are near-tie continuations shifted by different FFN numbers, and the
+count of frames where the mark is seen at all is unchanged.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships
