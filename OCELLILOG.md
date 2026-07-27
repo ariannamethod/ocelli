@@ -281,6 +281,25 @@ watermark, so int8 done right does not have to cost accuracy. Next probe is a
 hybrid — int8 on the FFN projections, where the 21× lives, and the exact dot on
 attention, where token placement is decided.
 
+### Hybrid decode: int8 on FFN, exact on attention — 1.7× and nothing lost
+
+The all-int8 result said where the sensitivity lives. Attention projections
+decide where the model looks; FFN projections do not. Splitting the policy along
+that line:
+
+| decode path | rate | watermark |
+|---|---|---|
+| exact everywhere | 8.0 tok/s | read in full |
+| **hybrid (default)** | **13.4 tok/s** | **read in full, output byte-identical to exact** |
+| int8 everywhere (`OCELLI_I8=1`) | 21.8 tok/s | lost |
+
+Same weights, same prompt, same frame. The hybrid is now the default; both
+extremes stay reachable by environment variable, `OCELLI_EXACT=1` for the
+reference path. Whole frame is about 22 s.
+
+Still short of the reference's 88.4 tok/s — that gap is now attention plus the
+tower, not FFN.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships

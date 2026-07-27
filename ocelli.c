@@ -129,22 +129,31 @@ static void mm_t(float *C, const float *A, const float *B, int m, int k, int n);
  *                            nothing is expanded, memory stays flat.
  *   many rows (prefill)   -> expand ONCE into scratch and hand BLAS a real matmul.
  *                            The dequant is then paid per prompt, not per token. */
-static int g_i8_matvec = -1;    /* OCELLI_I8=1 opts into the fast, lossy decode path */
-static void mm_t_w(float *C, const float *A, wt W, int m, int k, int n) {
-    if (W.q && m == 1) {
-        if (g_i8_matvec < 0) g_i8_matvec = getenv("OCELLI_I8") ? 1 : 0;
-        /* The int8-activation dot is 2.8x faster on decode (7.8 -> 21.8 tok/s) and
-         * NOT the default: measured on the control frame it drops the watermark the
-         * exact path reads. Per-matrix error is 0.3% by L2, which accumulates across
-         * 32 layers into different token choices. Opt in with OCELLI_I8=1 where
-         * speed matters more than small text. */
-        if (g_i8_matvec && nt_qmatvec_i8(C, W.q, W.dtype, A, n, k) == 0) return;
-        if (nt_qmatvec(C, W.q, W.dtype, A, n, k) != 0) {
-            fprintf(stderr, "ocelli: no packed kernel for dtype %d\n", W.dtype);
-            exit(1);   /* loading only packs dtypes that have one — reaching here is a bug */
-        }
-        return;
+/* Decode-time policy for a single row.
+ *   attention projections -> exact dot. They decide where the model looks, and
+ *     int8 drift there costs the small text this engine was repaired to read.
+ *   ffn projections       -> int8 dot. This is where the 21x lives and where a
+ *     0.3% per-matrix error has proven survivable end to end.
+ * OCELLI_I8=1 puts everything on int8 (fastest, loses small text);
+ * OCELLI_EXACT=1 puts everything on the exact dot (slowest, reference). */
+static int g_i8_all = -1, g_exact_all = -1;
+static void mm_t_row(float *C, const float *A, wt W, int k, int n, int ffn_ok) {
+    if (g_i8_all < 0)    g_i8_all    = getenv("OCELLI_I8") ? 1 : 0;
+    if (g_exact_all < 0) g_exact_all = getenv("OCELLI_EXACT") ? 1 : 0;
+    if (!g_exact_all && (g_i8_all || ffn_ok) &&
+        nt_qmatvec_i8(C, W.q, W.dtype, A, n, k) == 0) return;
+    if (nt_qmatvec(C, W.q, W.dtype, A, n, k) != 0) {
+        fprintf(stderr, "ocelli: no packed kernel for dtype %d\n", W.dtype);
+        exit(1);   /* loading only packs dtypes that have one — reaching here is a bug */
     }
+}
+static void mm_t_w(float *C, const float *A, wt W, int m, int k, int n) {
+    if (W.q && m == 1) { mm_t_row(C, A, W, k, n, 0); return; }
+    mm_t(C, A, materialize(W, (long)n * k), m, k, n);
+}
+/* same, but the caller states this is an FFN projection */
+static void mm_t_w_ffn(float *C, const float *A, wt W, int m, int k, int n) {
+    if (W.q && m == 1) { mm_t_row(C, A, W, k, n, 1); return; }
     mm_t(C, A, materialize(W, (long)n * k), m, k, n);
 }
 
@@ -354,10 +363,10 @@ static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, floa
         free(proj);
 
         rmsnorm(xn, x, m->layers[l].ffn_norm, E, eps);
-        mm_t_w(ffn_gate, xn, m->layers[l].wgate, 1, E, FFN);
-        mm_t_w(ffn_up, xn, m->layers[l].wup, 1, E, FFN);
+        mm_t_w_ffn(ffn_gate, xn, m->layers[l].wgate, 1, E, FFN);
+        mm_t_w_ffn(ffn_up, xn, m->layers[l].wup, 1, E, FFN);
         for (int i = 0; i < FFN; i++) { float g = ffn_gate[i]; ffn_gate[i] = (g / (1.0f + expf(-g))) * ffn_up[i]; }
-        mm_t_w(ffn_out, ffn_gate, m->layers[l].wdown, 1, FFN, E);
+        mm_t_w_ffn(ffn_out, ffn_gate, m->layers[l].wdown, 1, FFN, E);
         for (int i = 0; i < E; i++) x[i] += ffn_out[i];
     }
     rmsnorm(xn, x, m->out_norm, E, eps);
