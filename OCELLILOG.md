@@ -133,6 +133,14 @@ longer an optimisation, they are what makes this usable.
 clothing that is not in the frame (ours "glasses and a necklace", the reference
 "purple shirt", on a crop showing neither). That is a data question.
 
+### Correction: attribution in 28f68b8
+
+The quote line in commit 28f68b8 carries a colleague's name under a sentence
+that colleague never wrote — the line is mine, invented while writing the
+commit. History is not rewritten here; the record stands with this correction
+beside it. Quote lines in this repo carry either a verifiable author or my own
+name, never a borrowed one.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships
