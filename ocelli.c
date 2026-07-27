@@ -129,8 +129,16 @@ static void mm_t(float *C, const float *A, const float *B, int m, int k, int n);
  *                            nothing is expanded, memory stays flat.
  *   many rows (prefill)   -> expand ONCE into scratch and hand BLAS a real matmul.
  *                            The dequant is then paid per prompt, not per token. */
+static int g_i8_matvec = -1;    /* OCELLI_I8=1 opts into the fast, lossy decode path */
 static void mm_t_w(float *C, const float *A, wt W, int m, int k, int n) {
     if (W.q && m == 1) {
+        if (g_i8_matvec < 0) g_i8_matvec = getenv("OCELLI_I8") ? 1 : 0;
+        /* The int8-activation dot is 2.8x faster on decode (7.8 -> 21.8 tok/s) and
+         * NOT the default: measured on the control frame it drops the watermark the
+         * exact path reads. Per-matrix error is 0.3% by L2, which accumulates across
+         * 32 layers into different token choices. Opt in with OCELLI_I8=1 where
+         * speed matters more than small text. */
+        if (g_i8_matvec && nt_qmatvec_i8(C, W.q, W.dtype, A, n, k) == 0) return;
         if (nt_qmatvec(C, W.q, W.dtype, A, n, k) != 0) {
             fprintf(stderr, "ocelli: no packed kernel for dtype %d\n", W.dtype);
             exit(1);   /* loading only packs dtypes that have one — reaching here is a bug */

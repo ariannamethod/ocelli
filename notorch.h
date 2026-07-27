@@ -39,7 +39,7 @@ typedef struct {
 } nt_tensor;
 
 // Create a 1D tensor of given length, zeroed
-nt_tensor* nt_tensor_new(int len);
+nt_tensor* nt_tensor_new(size_t len);
 
 // Create a 2D tensor (rows × cols), zeroed
 nt_tensor* nt_tensor_new2d(int rows, int cols);
@@ -123,6 +123,8 @@ void nt_tensor_print(const nt_tensor* t, const char* name);
 #define NT_OP_SEQ_CROSSENT_MASKED 32  // masked sequence cross-entropy (parent3 = mask)
 #define NT_OP_RRPRAM_LR     33   // low-rank RRPRAM (Wr = Wr_a × Wr_b packed in one tensor)
 #define NT_OP_RRPRAM_BCAST  34   // broadcast RRPRAM — mid[h,r] = Σ_t x[t]·Wr_a[h] (canonical Janus pattern, sc=1/sqrt(D))
+#define NT_OP_RELU          35   // y = max(0, x) — rectified linear unit
+#define NT_OP_SEQ_GATE      36   // out[t,d] = x[t,d] * gate[t,gi] — per-position mechanism gate
 
 typedef struct {
     nt_tensor* output;          // forward result
@@ -353,6 +355,15 @@ int nt_silu(int x_idx);
 // Sigmoid activation: y = 1 / (1 + exp(-x))
 int nt_sigmoid(int x_idx);
 
+// ReLU activation: y = max(0, x)
+int nt_relu(int x_idx);
+
+// Per-position mechanism gate (q triple-attention): out[t,d] = x[t,d] * gate[t*nm+gi].
+// x is [T, B] (B = x.len/T), gate is [T, nm]; gi selects which gate column scales this
+// mechanism's block. Backward flows to x (dout*gate) and to gate column gi
+// (Σ_d dout[t,d]*x[t,d]); other gate columns get zero gradient.
+int nt_seq_gate(int x_idx, int g_idx, int T, int nm, int gi);
+
 // Broadcast scale: y[i] = a[0] * x[i], where a is a scalar tensor (shape [1]).
 // Grad flows to both x (gx = a*gy) and a (ga = sum(gy*x)).
 int nt_scale_by_t(int x_idx, int a_idx);
@@ -443,8 +454,15 @@ int nt_rrpram_lowrank_attention(int wr_combined_idx, int x_idx, int v_idx,
 // score[h,j] = Σ_r mid[h,r] · Wr_b[h,r,j] * sc with sc = 1/sqrt(D) (canonical scale).
 // attn[h,i,j] = softmax_causal(scores[h])[i,j] for j ≤ i.
 // out[i, h_off+d] = Σ_{j≤i} attn[h,i,j] · v[j, h_off+d].
+//
+// Use this when training/inferring against weights produced by canonical Janus models —
+// nt_rrpram_lowrank_attention's per-position pattern is a function-class-different op
+// and DoE LoRA training against it plateaus near uniform-distribution loss.
+// rank is REQUIRED — packed weight is H*R*(E + ctx_T), and ctx_T is derived from
+// combined_len / (H*rank) - n_embd. Caller passes the model's rank from JANU header.
+// head_dim must satisfy nr_heads*head_dim == n_embd (Janus invariant).
 int nt_rrpram_broadcast_attention(int wr_combined_idx, int x_idx, int v_idx,
-                                   int T, int n_embd, int nr_heads, int head_dim);
+                                   int T, int n_embd, int nr_heads, int head_dim, int rank);
 
 // Concatenate per-position: out[t] = [a[t], b[t]]. a: [T, D_a], b: [T, D_b] → out: [T, D_a+D_b]
 int nt_concat(int a_idx, int b_idx, int T);

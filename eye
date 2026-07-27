@@ -9,6 +9,10 @@
 set -u
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# packed-matvec threading floor for THIS shape: notorch's 4M default was measured
+# on a 360M decoder; ours are 2.46M and would never thread. Measured here: 256K
+# takes decode from 3.7 to 7.3 tok/s with byte-identical output.
+export NT_QMV_THREAD_MIN=${NT_QMV_THREAD_MIN:-262144}
 MODEL=${EYE_MODEL:-$DIR/models/yent_eye_smolvlm2_lora_v2_f16.gguf}
 MMPROJ=${EYE_MMPROJ:-$DIR/models/yent_eye_smolvlm2_lora_v2_mmproj_f16.gguf}
 

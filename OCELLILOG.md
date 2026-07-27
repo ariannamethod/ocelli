@@ -253,6 +253,34 @@ Metal backend that notorch already carries.
 Decode at 7.7 tok/s against the reference's 88.4 is the other front, and it
 needs an int8-activation kernel — the vendored one exists only for Q4_0.
 
+### int8 decode: 2.8× faster and it loses the watermark — so it is not the default
+
+The packed matvec now has an int8-activation sibling for Q8_0 in notorch
+(`nt_qmatvec_i8`), and the vendored copy here is byte-identical to canon. Kernel
+agreement against the exact dot was measured on real tensors of these weights:
+rel L2 0.0027–0.0038, 4.3× on attention shapes and 21× on FFN shapes.
+
+End to end on the control frame, same weights, same prompt:
+
+| decode path | rate | watermark |
+|---|---|---|
+| exact (default) | 8.0 tok/s | `StyleGAN2 (Karras et al.)` read in full |
+| int8 (`OCELLI_I8=1`) | **21.8 tok/s** | **lost** — the sentence ends in a blurry background |
+
+Three parts in a thousand per matrix is not small once it passes through 32
+layers: the accumulated drift changes token choices, and the first thing to go
+is exactly what this engine was fixed to see. So the exact dot stays the default
+and int8 is opt-in, for callers who want speed over small text.
+
+The threading floor is no longer patched into the vendored copy — canon takes
+`NT_QMV_THREAD_MIN` and `eye` sets 256K for this shape, so vendor stays a clean
+mirror of canon.
+
+Target unmet: the reference decodes at 88.4 tok/s while reading the same
+watermark, so int8 done right does not have to cost accuracy. Next probe is a
+hybrid — int8 on the FFN projections, where the 21× lives, and the exact dot on
+attention, where token placement is decided.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships
