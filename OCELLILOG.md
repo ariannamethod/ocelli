@@ -223,6 +223,36 @@ tok/s (single-threaded packed matvec — the kernel only threads above 4M elemen
 and our matrices are 2.46M) and the tower at 17.3 s (f32, one frame at a time).
 Prefill is no longer a problem.
 
+### Threading floor: a constant measured on another shape
+
+The packed matvec only fanned out above 4M elements. That floor was measured on
+a 360M model, where fan-out was noise; a 500M decoder's matrices are 2.46M and
+sat just under it, so the entire decode ran single-threaded. Made tunable
+(`NT_QMV_THREAD_MIN`) and measured on one frame, same weights, byte-identical
+output both times:
+
+| floor | decode |
+|---|---|
+| 4M (previous) | 4895 ms / 18 tok — 3.7 tok/s |
+| 256K (now default here) | 2455 ms / 18 tok — **7.3 tok/s** |
+
+Full tiled frame after the change: vision 16556 ms, prompt 2956 ms (386.7
+tok/s), generation 5212 ms (**7.7 tok/s**, was 3.2), peak RSS 1006 MB, watermark
+still read in full. Whole frame **24.7 s** against 32.7 s before and 405 s at
+the start of the day; the reference does the same frame in 5.9 s, so the gap is
+4.2×.
+
+### Where the remaining time actually is
+
+Of 24.7 s, the tower is 16.6 s — two thirds. Seventeen SigLIP passes are roughly
+1.6 TFLOP, which at 17 s is ~95 GFLOPS: that is already near what Accelerate
+gets out of f32 sgemm on this chip. The tower is not slow because of our loop;
+it is at the CPU f32 ceiling. Going further there means f16 arithmetic or the
+Metal backend that notorch already carries.
+
+Decode at 7.7 tok/s against the reference's 88.4 is the other front, and it
+needs an int8-activation kernel — the vendored one exists only for Q4_0.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships

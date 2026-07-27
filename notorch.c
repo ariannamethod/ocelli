@@ -4881,7 +4881,18 @@ int nt_qmatvec(float *out, const uint8_t *Wq, int dtype,
     // fan-out counterproductive for small single-token decode matvecs (measured ~6%/noise
     // on a 360M model). Gate it high: only large matvecs (big models / batched work) thread,
     // where the spawn cost amortizes; small decode stays single-thread.
-    if (nt <= 1 || (long)m * k < (4L << 20)) { fn(out, Wq, x, 0, m, k); return 0; }
+    /* The 4M floor was measured on a 360M model, where fan-out was noise. Other
+     * shapes exist: a 500M decoder's matrices are 2.46M and sit just under it,
+     * so the whole decode runs single-threaded. The floor is now tunable —
+     * default unchanged, NT_QMV_THREAD_MIN overrides it for measurement. */
+    static long thread_floor = -1;
+    if (thread_floor < 0) {
+        const char *e = getenv("NT_QMV_THREAD_MIN");
+        /* measured here: 2.46M-element matrices decode at 3.7 tok/s under the 4M
+         * floor and 7.3 tok/s under a 256K floor, same output byte for byte */
+        thread_floor = (e && atol(e) > 0) ? atol(e) : (256L << 10);
+    }
+    if (nt <= 1 || (long)m * k < thread_floor) { fn(out, Wq, x, 0, m, k); return 0; }
 
     pthread_t th[NT_QMV_MAX_THREADS];
     nt_qjob   jobs[NT_QMV_MAX_THREADS];
