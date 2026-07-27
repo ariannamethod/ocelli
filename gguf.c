@@ -435,6 +435,34 @@ static uint64_t gguf_dtype_nbytes(uint32_t dtype, uint64_t n) {
     return blocks * per;
 }
 
+int gguf_dequant_raw(const uint8_t* src, uint32_t dtype, uint64_t n_elements, float* dst) {
+    if (!src || !dst) return -1;
+    switch (dtype) {
+    case GGUF_TYPE_F32: memcpy(dst, src, (size_t)n_elements * sizeof(float)); return 0;
+    case GGUF_TYPE_F16: {
+        const uint16_t* f16 = (const uint16_t*)src;
+        for (uint64_t i = 0; i < n_elements; i++) dst[i] = f16_to_f32(f16[i]);
+        return 0;
+    }
+    case GGUF_TYPE_Q4_0: dequant_q4_0(src, dst, n_elements); return 0;
+    case GGUF_TYPE_Q5_0: dequant_q5_0(src, dst, n_elements); return 0;
+    case GGUF_TYPE_Q8_0: dequant_q8_0(src, dst, n_elements); return 0;
+    case GGUF_TYPE_Q4_K: dequant_q4_k(src, dst, n_elements); return 0;
+    case GGUF_TYPE_Q6_K: dequant_q6_k(src, dst, n_elements); return 0;
+    default: return -1;
+    }
+}
+
+uint64_t gguf_tensor_nbytes(const gguf_file* gf, int tensor_idx) {
+    if (!gf || tensor_idx < 0 || tensor_idx >= (int)gf->n_tensors) return 0;
+    const gguf_tensor_info* ti = &gf->tensors[tensor_idx];
+    uint64_t nbytes = gguf_dtype_nbytes(ti->dtype, ti->n_elements);
+    /* same bounds rule as gguf_dequant: a tensor that does not fit its own data
+     * block is not a tensor, it is a malformed file */
+    if (nbytes == 0 || ti->offset >= gf->data_size || nbytes > gf->data_size - ti->offset) return 0;
+    return nbytes;
+}
+
 float* gguf_dequant(const gguf_file* gf, int tensor_idx) {
     if (!gf || tensor_idx < 0 || tensor_idx >= (int)gf->n_tensors) return NULL;
     const gguf_tensor_info* ti = &gf->tensors[tensor_idx];

@@ -141,6 +141,88 @@ commit. History is not rewritten here; the record stands with this correction
 beside it. Quote lines in this repo carry either a verifiable author or my own
 name, never a borrowed one.
 
+### Packed weights and batched prefill
+
+Two changes, measured separately because they pull in different directions.
+
+**Packed weights.** A weight whose dtype has a notorch row kernel is now kept
+exactly as it sits in the file and dotted per block (`nt_qmatvec`), instead of
+being expanded to f32 at load. Token embeddings stay dense — they are read
+row-wise and packing buys nothing there. Peak RSS on the control frame fell from
+2202 MB (Q8 expanded) and 1110 MB (f16) to **528 MB**, output unchanged.
+
+Packed alone, however, made generation *slower*: a per-block scalar dot loses to
+vectorised BLAS on expanded weights, and `nt_qmatvec` only threads above 4M
+elements while our matrices are 2.46M — the whole decode runs single-threaded.
+
+**Batched prefill.** The prompt was being run as one forward per token: 1143
+separate matvecs where the reference runtime does one matmul per layer. Prefill
+now processes the whole prompt at once, so each weight is expanded ONCE into
+scratch and multiplied against all rows — the dequant cost is paid per prompt
+instead of per token.
+
+| path | prompt (1143 tok) | rate | peak RSS |
+|---|---|---|---|
+| f16, per-token | 374955 ms | 3.0 tok/s | 1110 MB |
+| Q8 packed, per-token | 481764 ms* | 2.4 tok/s* | 528 MB |
+| Q8 packed, batched prefill | **2853 ms** | **400.6 tok/s** | 916 MB |
+
+\* measured under contention, upper bound only.
+
+131× on the prompt, and above the reference runtime's 244 tok/s on the same
+prompt. Output is byte-identical to the per-token path, watermark included, so
+the batch is arithmetically equivalent rather than approximately similar. Whole
+frame: **31 s** (vision 16 s + prompt 2.9 s + generation 12 s) against 405 s
+before.
+
+RSS rose from 528 MB to 916 MB because prefill scratch and the dense token
+embedding table (49280×960 f32 = 189 MB) are live at once; keeping embeddings
+packed and extracting rows on demand is the obvious next cut.
+
+**Still slow: generation at 3.3 tok/s**, single-threaded packed matvec. Raising
+the kernel's threading floor is the next lever and it lives in vendored notorch,
+which makes it ours.
+
+### Small-text metric, re-measured end to end
+
+Same 14 portraits, same prompt, final binary (tiling + packed Q8 + batched
+prefill). True watermark on every frame: `StyleGAN2 (Karras et al.)`.
+
+| runtime | exact reads | corrupted | not seen |
+|---|---|---|---|
+| this engine, before (single frame) | 0 / 14 | 2 | 12 |
+| this engine, now | **4 / 14** | 1 (`Icán`) | 8 |
+| reference runtime | 5 / 14 | 3 | 6 |
+
+Exact reads: Alex Cox, Chloe Gloop, Laura Bishop (`StyleGAN2 (Karras et al.)`
+in full), Toby Ferguson (both halves). One partial: `StyleGAN` without the
+digit. Whole frame now costs 31 s (vision 16 s, prompt 2.9 s, generation 12 s)
+against 405 s before.
+
+A 14/14 target is not reachable in this form — the reference runtime does not
+reach it either on the same weights. The honest bar is "not worse than the
+reference", and the gap is now one frame.
+
+### Two columns, same machine, same weights, same frame
+
+Free machine, Q8 weights, tiling on both sides, one 1024×1024 portrait:
+
+| column | reference | ocelli | gap |
+|---|---|---|---|
+| prefill (1143 tok) | 4459 ms — 256.3 tok/s | **2931 ms — 390.0 tok/s** | ours 1.5× faster |
+| decode | 396 ms — 88.4 tok/s | 12496 ms — 3.2 tok/s | **ours 28× slower** |
+| vision (17 slices) | inside its prompt-eval accounting | 17290 ms | listed separately |
+| whole frame | **5917 ms** | 32717 ms | ours 5.5× slower |
+
+Caveat so the columns do not lie: the reference appears to fold slice encoding
+into its prompt-eval figure while ours is a separate line, so only the
+whole-frame row is directly comparable.
+
+Where the remaining distance lives, named rather than averaged: decode at 3.2
+tok/s (single-threaded packed matvec — the kernel only threads above 4M elements
+and our matrices are 2.46M) and the tower at 17.3 s (f32, one frame at a time).
+Prefill is no longer a problem.
+
 ### Open
 
 - Hot path still runs dense f32 through BLAS. The vendored notorch already ships

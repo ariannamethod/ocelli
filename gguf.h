@@ -88,6 +88,18 @@ int gguf_find_tensor(const gguf_file* gf, const char* name);
 // Handles: F32 (copy), F16 (convert), Q8_0 (dequant), Q4_0 (dequant).
 float* gguf_dequant(const gguf_file* gf, int tensor_idx);
 
+// On-disk byte size of tensor `idx` as stored (quantised blocks included), or 0
+// if the dtype is unknown or the element count is malformed. Lets a caller keep
+// a tensor PACKED instead of dequantising it into f32.
+uint64_t gguf_tensor_nbytes(const gguf_file* gf, int tensor_idx);
+
+// Dequantise a packed buffer held by the caller (kept via gguf_tensor_nbytes)
+// into `dst`, n_elements floats. Same block layouts as gguf_dequant, without
+// needing the gguf_file to still be open. Returns 0 on success, -1 on an
+// unsupported dtype. Used to expand a weight ONCE per prompt instead of once
+// per token.
+int gguf_dequant_raw(const uint8_t* src, uint32_t dtype, uint64_t n_elements, float* dst);
+
 // Load tensor as f16 (uint16_t) — half the RAM of gguf_dequant. Raw copy if the
 // tensor is already F16; otherwise dequant to f32 then round to f16. Caller frees.
 // Used for matmul weights (lazy-dequant to a scratch f32 buffer at matmul time).

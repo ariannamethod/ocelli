@@ -65,36 +65,104 @@ static inline float f16_to_f32_smol(uint16_t h) {
     else { r = sign | ((exp + 127 - 15) << 23) | (mant << 13); }
     float f; memcpy(&f, &r, 4); return f;
 }
-typedef struct { const uint16_t *f16; const float *f32; } wt;   /* exactly one set */
+/* A weight is kept in exactly one form: quantised blocks as they sit in the
+ * file (q, with its GGUF dtype), raw f16, or f32. Packed is preferred wherever
+ * notorch has a kernel for the dtype — the decoder then dots straight against
+ * the blocks instead of expanding half a billion weights per token. */
+typedef struct { const uint16_t *f16; const float *f32; const uint8_t *q; int dtype; } wt;
 
-static wt load_wt(gguf_file *gf, const char *name) {
-    wt w = {NULL, NULL};
+static int dtype_has_packed_kernel(uint32_t dt) {
+    switch (dt) {   /* row kernels present in the vendored notorch */
+    case GGUF_TYPE_Q4_0: case GGUF_TYPE_Q5_0: case GGUF_TYPE_Q8_0:
+    case GGUF_TYPE_Q4_K: case GGUF_TYPE_Q6_K: return 1;
+    default: return 0;
+    }
+}
+
+/* dense form: f16 if the tensor is f16, else f32. For weights read row-wise
+ * (token embeddings), where a packed block layout would not help. */
+static wt load_wt_dense(gguf_file *gf, const char *name) {
+    wt w = {NULL, NULL, NULL, 0};
     int ti = gguf_find_tensor(gf, name);
     if (ti < 0) return w;
     w.f16 = gguf_load_f16(gf, ti);          /* non-NULL iff tensor is F16 */
     if (!w.f16) w.f32 = gguf_dequant(gf, ti);
     return w;
 }
-static int wt_ok(wt w) { return w.f16 || w.f32; }
+
+static wt load_wt(gguf_file *gf, const char *name) {
+    wt w = {NULL, NULL, NULL, 0};
+    int ti = gguf_find_tensor(gf, name);
+    if (ti < 0) return w;
+    uint32_t dt = gf->tensors[ti].dtype;
+    if (dtype_has_packed_kernel(dt)) {
+        uint64_t nb = gguf_tensor_nbytes(gf, ti);
+        if (nb) {
+            uint8_t *q = (uint8_t*)malloc((size_t)nb);
+            if (q) {
+                memcpy(q, gf->data + gf->tensors[ti].offset, (size_t)nb);
+                w.q = q; w.dtype = (int)dt;
+                return w;
+            }
+        }   /* allocation or bounds failure falls through to the dense path */
+    }
+    return load_wt_dense(gf, name);
+}
+static int wt_ok(wt w) { return w.f16 || w.f32 || w.q; }
 
 static float *g_wscratch = NULL; static long g_wscap = 0;
-static const float *materialize(wt w, long n) {        /* -> f32 view (scratch if f16) */
+static const float *materialize(wt w, long n) {        /* -> f32 view (scratch if f16/packed) */
     if (w.f32) return w.f32;
-    if (!w.f16) return NULL;
+    if (!w.f16 && !w.q) return NULL;
     if (n > g_wscap) { free(g_wscratch); g_wscratch = (float*)malloc(n * sizeof(float));
                        g_wscap = g_wscratch ? n : 0; }   /* cap only on success -> retry works */
     if (!g_wscratch) return NULL;                        /* OOM: no NULL write */
-    gguf_f16_to_f32_n(w.f16, g_wscratch, n);
+    if (w.f16) gguf_f16_to_f32_n(w.f16, g_wscratch, n);
+    else if (gguf_dequant_raw(w.q, (uint32_t)w.dtype, (uint64_t)n, g_wscratch) != 0) return NULL;
     return g_wscratch;
 }
 
 static void mm_t(float *C, const float *A, const float *B, int m, int k, int n);  /* fwd */
 /* C[m,n] = A[m,k] @ W[n,k]^T with a wt weight (lazy-dequant) */
+/* Policy, and the whole point of keeping weights packed:
+ *   one row (generation)  -> notorch's packed matvec: dequant lives in registers,
+ *                            nothing is expanded, memory stays flat.
+ *   many rows (prefill)   -> expand ONCE into scratch and hand BLAS a real matmul.
+ *                            The dequant is then paid per prompt, not per token. */
 static void mm_t_w(float *C, const float *A, wt W, int m, int k, int n) {
+    if (W.q && m == 1) {
+        if (nt_qmatvec(C, W.q, W.dtype, A, n, k) != 0) {
+            fprintf(stderr, "ocelli: no packed kernel for dtype %d\n", W.dtype);
+            exit(1);   /* loading only packs dtypes that have one — reaching here is a bug */
+        }
+        return;
+    }
     mm_t(C, A, materialize(W, (long)n * k), m, k, n);
+}
+
+/* C[m,n] = A[m,k] @ B[k,n] — plain product, needed for scores @ V in batched attention */
+static void mm_nn(float *C, const float *A, const float *B, int m, int k, int n) {
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                m, n, k, 1.0f, A, k, B, n, 0.0f, C, n);
+#else
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) {
+            float s = 0;
+            for (int p = 0; p < k; p++) s += A[(long)i*k+p] * B[(long)p*n+j];
+            C[(long)i*n+j] = s;
+        }
+#endif
 }
 /* lm_head matvec: logits[v] = sum_k x[k]*W[v,k], W f16-or-f32, no big scratch (per-element) */
 static void lmhead(wt W, const float *x, float *logits, int vocab, int E) {
+    if (W.q) {
+        if (nt_qmatvec(logits, W.q, W.dtype, x, vocab, E) != 0) {
+            fprintf(stderr, "ocelli: no packed kernel for dtype %d (lm head)\n", W.dtype);
+            exit(1);
+        }
+        return;
+    }
     if (W.f32) { mm_t(logits, x, W.f32, 1, E, vocab); return; }
     const uint16_t *w = W.f16;
     for (int v = 0; v < vocab; v++) {
@@ -180,7 +248,7 @@ static llama_model* llama_load(gguf_file* gf) {
            m->embed, m->n_heads, m->n_kv_heads, m->ffn, m->vocab, nl, m->head_dim, m->q_dim,
            m->rope_base, m->rms_eps);
 
-    m->tok_emb = load_wt(gf, "token_embd.weight");
+    m->tok_emb = load_wt_dense(gf, "token_embd.weight");   /* read row-wise, packing would not help */
     ti = gguf_find_tensor(gf, "output_norm.weight");  if (ti >= 0) m->out_norm = gguf_dequant(gf, ti);
     m->out_weight = load_wt(gf, "output.weight");
     m->has_output_weight = wt_ok(m->out_weight);
@@ -289,6 +357,110 @@ static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, floa
 
     free(x); free(xn); free(q_all); free(k_new); free(v_new);
     free(attn_out); free(ffn_gate); free(ffn_up); free(ffn_out);
+}
+
+/* Batched prefill: the whole prompt in one pass per layer instead of one pass per
+ * token. Every weight multiply becomes a matmul over n rows, which is what makes
+ * a packed weight cheap — it is expanded once and reused across the prompt.
+ * Writes K/V for all positions so generation continues from here; returns the
+ * logits of the LAST position only. */
+static int llama_prefill(llama_model *m, kv_cache *kv, const int *toks, int n,
+                         const float *vemb, int TD, int n_vis, float *logits) {
+    int E = m->embed, H = m->n_heads, KV = m->n_kv_heads;
+    int HD = m->head_dim, KVD = m->kv_dim, FFN = m->ffn, Q_DIM = m->q_dim;
+    float eps = m->rms_eps; int gqa = H / KV;
+    if (n <= 0 || n > kv->max_seq) return -1;
+
+    float *X  = (float*)malloc((long)n * E * sizeof(float));
+    float *XN = (float*)malloc((long)n * E * sizeof(float));
+    float *Qb = (float*)malloc((long)n * Q_DIM * sizeof(float));
+    float *Kb = (float*)malloc((long)n * KVD * sizeof(float));
+    float *Vb = (float*)malloc((long)n * KVD * sizeof(float));
+    float *AT = (float*)calloc((long)n * Q_DIM, sizeof(float));
+    float *PR = (float*)malloc((long)n * E * sizeof(float));
+    float *G  = (float*)malloc((long)n * FFN * sizeof(float));
+    float *U  = (float*)malloc((long)n * FFN * sizeof(float));
+    float *SC = (float*)malloc((long)n * n * sizeof(float));
+    float *qh = (float*)malloc((long)n * HD * sizeof(float));
+    float *kh = (float*)malloc((long)n * HD * sizeof(float));
+    float *vh = (float*)malloc((long)n * HD * sizeof(float));
+    float *oh = (float*)malloc((long)n * HD * sizeof(float));
+    if (!X || !XN || !Qb || !Kb || !Vb || !AT || !PR || !G || !U || !SC || !qh || !kh || !vh || !oh) {
+        free(X); free(XN); free(Qb); free(Kb); free(Vb); free(AT); free(PR);
+        free(G); free(U); free(SC); free(qh); free(kh); free(vh); free(oh);
+        return -1;
+    }
+
+    /* embeddings, with visual rows spliced in at <image> positions */
+    int vis_slot = 0;
+    for (int i = 0; i < n; i++) {
+        float *row = X + (long)i * E;
+        if (toks[i] == 49190 && vemb && vis_slot < n_vis && TD == E) {
+            memcpy(row, vemb + (long)(vis_slot++) * TD, E * sizeof(float));
+        } else if (m->tok_emb.f32) {
+            memcpy(row, m->tok_emb.f32 + (long)toks[i] * E, E * sizeof(float));
+        } else {
+            const uint16_t *r = m->tok_emb.f16 + (long)toks[i] * E;
+            for (int j = 0; j < E; j++) row[j] = f16_to_f32_smol(r[j]);
+        }
+    }
+
+    for (int l = 0; l < m->n_layers; l++) {
+        for (int i = 0; i < n; i++)
+            rmsnorm(XN + (long)i * E, X + (long)i * E, m->layers[l].attn_norm, E, eps);
+        mm_t_w(Qb, XN, m->layers[l].wq, n, E, Q_DIM);
+        mm_t_w(Kb, XN, m->layers[l].wk, n, E, KVD);
+        mm_t_w(Vb, XN, m->layers[l].wv, n, E, KVD);
+        for (int i = 0; i < n; i++) {
+            add_bias(Qb + (long)i * Q_DIM, m->layers[l].q_bias, Q_DIM);
+            add_bias(Kb + (long)i * KVD, m->layers[l].k_bias, KVD);
+            add_bias(Vb + (long)i * KVD, m->layers[l].v_bias, KVD);
+            for (int h = 0; h < H; h++)  rope(Qb + (long)i * Q_DIM + h * HD, i, HD, m->rope_base);
+            for (int h = 0; h < KV; h++) rope(Kb + (long)i * KVD + h * HD, i, HD, m->rope_base);
+        }
+        long base = (long)l * kv->max_seq * KVD;
+        for (int i = 0; i < n; i++) {
+            memcpy(kv->k + base + (long)i * KVD, Kb + (long)i * KVD, KVD * sizeof(float));
+            memcpy(kv->v + base + (long)i * KVD, Vb + (long)i * KVD, KVD * sizeof(float));
+        }
+
+        float scale = 1.0f / sqrtf((float)HD);
+        for (int h = 0; h < H; h++) {
+            int kvh = h / gqa;
+            for (int i = 0; i < n; i++) {
+                memcpy(qh + (long)i * HD, Qb + (long)i * Q_DIM + h * HD, HD * sizeof(float));
+                memcpy(kh + (long)i * HD, Kb + (long)i * KVD + kvh * HD, HD * sizeof(float));
+                memcpy(vh + (long)i * HD, Vb + (long)i * KVD + kvh * HD, HD * sizeof(float));
+            }
+            mm_t(SC, qh, kh, n, HD, n);                  /* scores[n,n] = q @ k^T */
+            for (int i = 0; i < n; i++) {                /* causal mask + softmax per row */
+                float *r = SC + (long)i * n;
+                for (int j = 0; j <= i; j++) r[j] *= scale;
+                for (int j = i + 1; j < n; j++) r[j] = -INFINITY;
+                softmax(r, n);
+            }
+            mm_nn(oh, SC, vh, n, n, HD);
+            for (int i = 0; i < n; i++)
+                memcpy(AT + (long)i * Q_DIM + h * HD, oh + (long)i * HD, HD * sizeof(float));
+        }
+        mm_t_w(PR, AT, m->layers[l].wo, n, Q_DIM, E);
+        for (long i = 0; i < (long)n * E; i++) X[i] += PR[i];
+
+        for (int i = 0; i < n; i++)
+            rmsnorm(XN + (long)i * E, X + (long)i * E, m->layers[l].ffn_norm, E, eps);
+        mm_t_w(G, XN, m->layers[l].wgate, n, E, FFN);
+        mm_t_w(U, XN, m->layers[l].wup, n, E, FFN);
+        for (long i = 0; i < (long)n * FFN; i++) { float g = G[i]; G[i] = (g / (1.0f + expf(-g))) * U[i]; }
+        mm_t_w(PR, G, m->layers[l].wdown, n, FFN, E);
+        for (long i = 0; i < (long)n * E; i++) X[i] += PR[i];
+    }
+
+    rmsnorm(XN, X + (long)(n - 1) * E, m->out_norm, E, eps);   /* last position only */
+    lmhead(m->has_output_weight ? m->out_weight : m->tok_emb, XN, logits, m->vocab, E);
+
+    free(X); free(XN); free(Qb); free(Kb); free(Vb); free(AT); free(PR);
+    free(G); free(U); free(SC); free(qh); free(kh); free(vh); free(oh);
+    return 0;
 }
 
 static int argmax(const float *x, int n) {
@@ -458,14 +630,15 @@ int main(int argc, char **argv) {
 
         kv_cache *kv = kv_new(model->n_layers, MS, model->kv_dim);
         float *logits = (float*)calloc(model->vocab, sizeof(float));
-        int vis_slot = 0;
-        for (int i = 0; i < n_tok; i++) {
-            const float *ov = NULL;
-            if (toks[i] == 49190 && vis_slot < n_vis_total) ov = vemb + (long)(vis_slot++) * TD;  // splice
-            llama_forward(model, kv, toks[i], i, logits, ov);
+        if (llama_prefill(model, kv, toks, n_tok, vemb, TD, n_vis_total, logits) != 0) {
+            fprintf(stderr, "prefill failed (%d tokens)\n", n_tok); return 1;
         }
-        if (vis_slot != n_vis_total)   /* layout and budget must agree, or the tail is blind */
-            fprintf(stderr, "warning: spliced %d of %d visual tokens\n", vis_slot, n_vis_total);
+        {   /* the layout must consume exactly the visual tokens we produced */
+            int placed = 0;
+            for (int i = 0; i < n_tok; i++) if (toks[i] == 49190) placed++;
+            if (placed != n_vis_total)
+                fprintf(stderr, "warning: %d <image> slots for %d visual tokens\n", placed, n_vis_total);
+        }
         double t_prompt = now_ms() - t_start;
         char piece[256];
         int n_gen = 0;
