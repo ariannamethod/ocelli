@@ -1,5 +1,7 @@
 # ocelli
 
+> **Read the [Arianna Method Manifesto](ARIANNA_METHOD_MANIFESTO.md) first.** This repository is governed by it; every instruction here, `CLAUDE.md` included, is subordinate to it.
+
 Eyes of Yent. A vision-language engine in plain C: one image in, one honest
 sentence out — no cloud, no API, no Python at runtime.
 
