@@ -135,12 +135,15 @@ static void mm_t(float *C, const float *A, const float *B, int m, int k, int n);
  *   ffn projections       -> int8 dot. This is where the 21x lives and where a
  *     0.3% per-matrix error has proven survivable end to end.
  * OCELLI_I8=1 puts everything on int8 (fastest, loses small text);
- * OCELLI_EXACT=1 puts everything on the exact dot (slowest, reference). */
-static int g_i8_all = -1, g_exact_all = -1;
+ * OCELLI_EXACT=1 puts everything on the exact dot (slowest, reference).
+ * A body with a baked ffn_down.bias (g_down_bias, set by llama_load) keeps its
+ * ffn on the exact dot too unless OCELLI_I8=1: on such a body the int8 ffn
+ * moved 14 of 32 answers off the exact decode. */
+static int g_i8_all = -1, g_exact_all = -1, g_down_bias = 0;
 static void mm_t_row(float *C, const float *A, wt W, int k, int n, int ffn_ok) {
     if (g_i8_all < 0)    g_i8_all    = getenv("OCELLI_I8") ? 1 : 0;
     if (g_exact_all < 0) g_exact_all = getenv("OCELLI_EXACT") ? 1 : 0;
-    if (!g_exact_all && (g_i8_all || ffn_ok) &&
+    if (!g_exact_all && (g_i8_all || (ffn_ok && !g_down_bias)) &&
         nt_qmatvec_i8(C, W.q, W.dtype, A, n, k) == 0) return;
     if (nt_qmatvec(C, W.q, W.dtype, A, n, k) != 0) {
         fprintf(stderr, "ocelli: no packed kernel for dtype %d\n", W.dtype);
@@ -283,11 +286,17 @@ static llama_model* llama_load(gguf_file* gf) {
         L(ffn_norm, "blk.%d.ffn_norm.weight");
         LW(wgate, "blk.%d.ffn_gate.weight"); LW(wup, "blk.%d.ffn_up.weight"); LW(wdown, "blk.%d.ffn_down.weight");
         L(down_bias, "blk.%d.ffn_down.bias");
+        if (m->layers[l].down_bias) g_down_bias = 1;
         #undef L
         #undef LW
     }
     if (!wt_ok(m->tok_emb) || !m->out_norm) { fprintf(stderr, "ocelli: missing critical weights\n"); return NULL; }
     if (!m->has_output_weight) printf("  (tied embeddings)\n");
+    if (g_down_bias)
+        fprintf(stderr, "ocelli: baked ffn_down.bias: decode %s\n",
+                getenv("OCELLI_EXACT") ? "exact (OCELLI_EXACT=1)"
+                : getenv("OCELLI_I8") ? "int8 everywhere (OCELLI_I8=1)"
+                : "exact by default (OCELLI_I8=1 for int8)");
     return m;
 }
 
