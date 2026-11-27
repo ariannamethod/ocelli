@@ -236,6 +236,7 @@ typedef struct {
         float *q_bias, *k_bias, *v_bias;
         float *ffn_norm;
         wt wgate, wup, wdown;      /* f16-or-f32 */
+        float *down_bias;
     } layers[];
 } llama_model;
 
@@ -281,6 +282,7 @@ static llama_model* llama_load(gguf_file* gf) {
         L(q_bias, "blk.%d.attn_q.bias"); L(k_bias, "blk.%d.attn_k.bias"); L(v_bias, "blk.%d.attn_v.bias");
         L(ffn_norm, "blk.%d.ffn_norm.weight");
         LW(wgate, "blk.%d.ffn_gate.weight"); LW(wup, "blk.%d.ffn_up.weight"); LW(wdown, "blk.%d.ffn_down.weight");
+        L(down_bias, "blk.%d.ffn_down.bias");
         #undef L
         #undef LW
     }
@@ -367,6 +369,7 @@ static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, floa
         mm_t_w_ffn(ffn_up, xn, m->layers[l].wup, 1, E, FFN);
         for (int i = 0; i < FFN; i++) { float g = ffn_gate[i]; ffn_gate[i] = (g / (1.0f + expf(-g))) * ffn_up[i]; }
         mm_t_w_ffn(ffn_out, ffn_gate, m->layers[l].wdown, 1, FFN, E);
+        add_bias(ffn_out, m->layers[l].down_bias, E);
         for (int i = 0; i < E; i++) x[i] += ffn_out[i];
     }
     rmsnorm(xn, x, m->out_norm, E, eps);
@@ -469,6 +472,7 @@ static int llama_prefill(llama_model *m, kv_cache *kv, const int *toks, int n,
         mm_t_w(U, XN, m->layers[l].wup, n, E, FFN);
         for (long i = 0; i < (long)n * FFN; i++) { float g = G[i]; G[i] = (g / (1.0f + expf(-g))) * U[i]; }
         mm_t_w(PR, G, m->layers[l].wdown, n, FFN, E);
+        for (int i = 0; i < n; i++) add_bias(PR + (long)i * E, m->layers[l].down_bias, E);
         for (long i = 0; i < (long)n * E; i++) X[i] += PR[i];
     }
 
